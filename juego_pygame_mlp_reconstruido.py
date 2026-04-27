@@ -1,11 +1,12 @@
 import csv
 import math
+import os
 import random
 from dataclasses import dataclass
 
 import numpy as np
 import pygame
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
@@ -22,6 +23,7 @@ from sklearn.preprocessing import StandardScaler
 class Sample:
     velocidad_bala: float
     distancia: float
+    tiempo_impacto: float
     salto: int
 
 
@@ -91,16 +93,24 @@ class JuegoMLP:
 
         # Dataset y modelo
         self.datos_modelo = []
+        self.nuevas_muestras = []
         self.modelo = None
         self.scaler = None
         self.accuracy = None
+        self.precision = None
+        self.recall = None
+        self.f1 = None
         self.last_proba_salto = 0.0
         self.min_samples = 80
+
+        # Archivo principal de datos
+        self.csv_filename = "datos_mlp.csv"
 
         # Para registrar el salto por frame
         self.salto_solicitado_este_frame = 0
 
         self.reset_bala()
+        self.cargar_csv_automatico()
 
     # --------------------------------------------------------
     # Utilidades de estado
@@ -120,6 +130,9 @@ class JuegoMLP:
         self.modelo = None
         self.scaler = None
         self.accuracy = None
+        self.precision = None
+        self.recall = None
+        self.f1 = None
         self.last_proba_salto = 0.0
 
     def reset_juego(self):
@@ -140,10 +153,8 @@ class JuegoMLP:
     def iniciar_manual(self):
         self.estado = "manual"
         self.modo = "manual"
-        self.datos_modelo = []
-        self.reset_modelo()
         self.reset_juego()
-        self.set_message("Modo manual: dataset reiniciado")
+        self.set_message(f"Modo manual: dataset actual = {len(self.datos_modelo)} muestras")
 
     def iniciar_auto(self):
         self.estado = "auto"
@@ -209,12 +220,25 @@ class JuegoMLP:
         if not self.bala_activa:
             return
 
+        distancia = float(self.distancia_jugador_bala())
+
+        # Solo registrar cuando la bala ya es relevante.
+        # Esto evita miles de frames inútiles donde la respuesta correcta
+        # casi siempre es "no saltar".
+        if distancia < -20 or distancia > 220:
+            return
+
+        velocidad_abs = max(abs(float(self.bala_vel)), 0.001)
+        tiempo_impacto = distancia / velocidad_abs
+
         muestra = Sample(
             velocidad_bala=float(self.bala_vel),
-            distancia=float(self.distancia_jugador_bala()),
+            distancia=distancia,
+            tiempo_impacto=tiempo_impacto,
             salto=int(self.salto_solicitado_este_frame),
         )
         self.datos_modelo.append(muestra)
+        self.nuevas_muestras.append(muestra)
 
     # --------------------------------------------------------
     # MLP
@@ -224,7 +248,7 @@ class JuegoMLP:
             self.set_message(f"Muy pocas muestras: {len(self.datos_modelo)}/{self.min_samples}")
             return
 
-        X = np.array([[s.velocidad_bala, s.distancia] for s in self.datos_modelo], dtype=np.float32)
+        X = np.array([[s.velocidad_bala, s.distancia, s.tiempo_impacto] for s in self.datos_modelo], dtype=np.float32)
         y = np.array([s.salto for s in self.datos_modelo], dtype=np.int32)
 
         clases = np.unique(y)
@@ -240,8 +264,25 @@ class JuegoMLP:
             stratify=y,
         )
 
+        idx_0 = np.where(y_train == 0)[0]
+        idx_1 = np.where(y_train == 1)[0]
+        rng = np.random.RandomState(42)
+
+        if len(idx_0) > len(idx_1):
+            extra = rng.choice(idx_1, size=len(idx_0) - len(idx_1), replace=True)
+            idx_balanceados = np.concatenate([idx_0, idx_1, extra])
+        elif len(idx_1) > len(idx_0):
+            extra = rng.choice(idx_0, size=len(idx_1) - len(idx_0), replace=True)
+            idx_balanceados = np.concatenate([idx_0, idx_1, extra])
+        else:
+            idx_balanceados = np.concatenate([idx_0, idx_1])
+
+        rng.shuffle(idx_balanceados)
+        X_train_bal = X_train[idx_balanceados]
+        y_train_bal = y_train[idx_balanceados]
+
         scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
+        X_train_scaled = scaler.fit_transform(X_train_bal)
         X_test_scaled = scaler.transform(X_test)
 
         modelo = MLPClassifier(
@@ -250,28 +291,39 @@ class JuegoMLP:
             solver="adam",
             max_iter=3000,
             random_state=42,
+            early_stopping=True,
+            validation_fraction=0.1,
         )
-        modelo.fit(X_train_scaled, y_train)
+        modelo.fit(X_train_scaled, y_train_bal)
 
         y_pred = modelo.predict(X_test_scaled)
         acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
 
         self.modelo = modelo
         self.scaler = scaler
         self.accuracy = acc
-        self.set_message(f"MLP entrenado. Accuracy: {acc:.3f}")
+        self.precision = prec
+        self.recall = rec
+        self.f1 = f1
+        self.set_message(f"MLP entrenado | acc={acc:.3f} rec={rec:.3f} f1={f1:.3f}")
 
     def decision_auto_saltar(self):
         self.last_proba_salto = 0.0
         if self.modelo is None or self.scaler is None or not self.bala_activa:
             return
 
-        X = np.array([[float(self.bala_vel), float(self.distancia_jugador_bala())]], dtype=np.float32)
+        distancia = float(self.distancia_jugador_bala())
+        velocidad = float(self.bala_vel)
+        velocidad_abs = max(abs(velocidad), 0.001)
+        tiempo_impacto = distancia / velocidad_abs
+        X = np.array([[velocidad, distancia, tiempo_impacto]], dtype=np.float32)
         Xs = self.scaler.transform(X)
 
         proba = self.modelo.predict_proba(Xs)[0]
 
-        # En binaria scikit devuelve columnas según classes_
         if len(self.modelo.classes_) == 2 and 1 in self.modelo.classes_:
             idx_clase_1 = list(self.modelo.classes_).index(1)
             p_salto = float(proba[idx_clase_1])
@@ -280,28 +332,104 @@ class JuegoMLP:
             p_salto = 1.0 if pred == 1 else 0.0
 
         self.last_proba_salto = p_salto
-        if p_salto >= 0.5 and not self.saltando:
-            self.iniciar_salto()
+
+        # Ajuste dinámico: si la bala viene más lenta, esperamos menos distancia
+        # pero también bajamos el umbral del modelo para que no se quede pasivo.
+        velocidad_abs = abs(velocidad)
+        if velocidad_abs <= 7.0:
+            umbral_modelo = 0.28
+            umbral_distancia = 70
+        elif velocidad_abs <= 9.0:
+            umbral_modelo = 0.33
+            umbral_distancia = 85
+        else:
+            umbral_modelo = 0.38
+            umbral_distancia = 100
+
+        if not self.saltando:
+            if p_salto >= umbral_modelo:
+                self.iniciar_salto()
+            elif distancia <= umbral_distancia:
+                self.iniciar_salto()
 
     # --------------------------------------------------------
     # Exportar CSV
     # --------------------------------------------------------
-    def exportar_csv(self, filename="datos_mlp.csv"):
-        if not self.datos_modelo:
-            self.set_message("No hay datos para exportar")
+    def guardar_datos_csv(self, filename=None):
+        if filename is None:
+            filename = self.csv_filename
+
+        if not self.nuevas_muestras:
+            self.set_message("No hay muestras nuevas para guardar")
             return
+
+        existentes = []
+        existentes_keys = set()
+
+        if os.path.exists(filename):
+            try:
+                with open(filename, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        tiempo_impacto = float(row["tiempo_impacto"]) if "tiempo_impacto" in row and row["tiempo_impacto"] != "" else float(row["distancia"]) / max(abs(float(row["velocidad_bala"])), 0.001)
+                        s = Sample(
+                            velocidad_bala=float(row["velocidad_bala"]),
+                            distancia=float(row["distancia"]),
+                            tiempo_impacto=tiempo_impacto,
+                            salto=int(float(row["salto"])),
+                        )
+                        existentes.append(s)
+                        key = (round(s.velocidad_bala, 3), round(s.distancia, 3), round(s.tiempo_impacto, 3), int(s.salto))
+                        existentes_keys.add(key)
+            except Exception:
+                existentes = []
+                existentes_keys = set()
+
+        agregadas = 0
+        for s in self.nuevas_muestras:
+            key = (round(s.velocidad_bala, 3), round(s.distancia, 3), round(s.tiempo_impacto, 3), int(s.salto))
+            if key not in existentes_keys:
+                existentes.append(s)
+                existentes_keys.add(key)
+                agregadas += 1
 
         with open(filename, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["velocidad_bala", "distancia", "salto"])
-            for s in self.datos_modelo:
-                writer.writerow([s.velocidad_bala, s.distancia, s.salto])
+            writer.writerow(["velocidad_bala", "distancia", "tiempo_impacto", "salto"])
+            for s in existentes:
+                writer.writerow([s.velocidad_bala, s.distancia, s.tiempo_impacto, s.salto])
 
-        self.set_message(f"CSV exportado: {filename}")
+        self.datos_modelo = existentes
+        self.nuevas_muestras = []
+        self.set_message(f"G: {agregadas} muestras nuevas guardadas | total={len(existentes)}")
 
-    # --------------------------------------------------------
-    # Dibujo
-    # --------------------------------------------------------
+    def cargar_csv_automatico(self, filename=None):
+        if filename is None:
+            filename = self.csv_filename
+
+        if not os.path.exists(filename):
+            return
+
+        try:
+            datos = []
+            with open(filename, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    tiempo_impacto = float(row["tiempo_impacto"]) if "tiempo_impacto" in row and row["tiempo_impacto"] != "" else float(row["distancia"]) / max(abs(float(row["velocidad_bala"])), 0.001)
+                    datos.append(
+                        Sample(
+                            velocidad_bala=float(row["velocidad_bala"]),
+                            distancia=float(row["distancia"]),
+                            tiempo_impacto=tiempo_impacto,
+                            salto=int(float(row["salto"])),
+                        )
+                    )
+            self.datos_modelo = datos
+            self.nuevas_muestras = []
+            self.set_message(f"CSV cargado automáticamente: {len(datos)} muestras", 2.0)
+        except Exception as e:
+            self.set_message(f"Error cargando CSV: {e}")
+
     def draw_background(self):
         w, h = self.screen.get_size()
         self.screen.fill(self.CIELO)
@@ -342,14 +470,23 @@ class JuegoMLP:
         y = 18
         line_gap = 28
 
+        saltos_1 = sum(1 for s in self.datos_modelo if s.salto == 1)
+        saltos_0 = sum(1 for s in self.datos_modelo if s.salto == 0)
+
         textos = [
             f"Estado: {self.estado.upper()}",
             f"Modo: {self.modo if self.modo else '-'}",
             f"Score: {self.score}",
             f"Best: {self.best_score}",
             f"Muestras: {len(self.datos_modelo)}",
+            f"Nuevas sin guardar: {len(self.nuevas_muestras)}",
+            f"Clase 0 (no salto): {saltos_0}",
+            f"Clase 1 (salto): {saltos_1}",
             f"Accuracy: {self.accuracy:.3f}" if self.accuracy is not None else "Accuracy: -",
+            f"Recall salto: {self.recall:.3f}" if self.recall is not None else "Recall salto: -",
+            f"F1 salto: {self.f1:.3f}" if self.f1 is not None else "F1 salto: -",
             f"proba_salto ≈ {self.last_proba_salto:.2f}",
+            f"tti ≈ {max(self.distancia_jugador_bala(), 0) / max(abs(self.bala_vel), 0.001):.2f}",
         ]
 
         for t in textos:
@@ -376,14 +513,13 @@ class JuegoMLP:
         self.screen.blit(subtitle, (70, 130))
 
         opciones = [
-            "M = Modo Manual (reinicia dataset y borra modelo)",
-            "A = Modo Auto (usa el MLP; sin modelo no salta)",
+            "M = Manual (sin reiniciar dataset)",
+            "A = Automático",
             "T = Entrenar MLP",
-            "C = Exportar datos a CSV",
-            "F = Fullscreen",
-            "Q = Salir",
-            "ESPACIO = Saltar (solo jugando en manual)",
-            "ESC o P = Volver al menú",
+            "G = Guardar solo muestras nuevas en CSV",
+            "ESPACIO = Saltar en manual",
+            "ESC = Menú",
+            "F = Fullscreen | Q = Salir",
         ]
 
         y = 210
@@ -393,10 +529,10 @@ class JuegoMLP:
             y += 48
 
         resumen = [
-            f"Muestras actuales: {len(self.datos_modelo)}",
+            f"Muestras cargadas: {len(self.datos_modelo)}",
             f"Modelo entrenado: {'sí' if self.modelo is not None else 'no'}",
             f"Accuracy: {self.accuracy:.3f}" if self.accuracy is not None else "Accuracy: -",
-            "Tip: junta al menos 80 muestras y procura tener 0 y 1.",
+            "Tip: ahora el MLP también usa tiempo estimado de impacto.",
         ]
 
         y += 25
@@ -451,15 +587,17 @@ class JuegoMLP:
                 elif event.key == pygame.K_f:
                     self.toggle_fullscreen()
 
+                elif event.key == pygame.K_t:
+                    self.entrenar_modelo()
+
+                elif event.key == pygame.K_g:
+                    self.guardar_datos_csv()
+
                 if self.estado == "menu":
                     if event.key == pygame.K_m:
                         self.iniciar_manual()
                     elif event.key == pygame.K_a:
                         self.iniciar_auto()
-                    elif event.key == pygame.K_t:
-                        self.entrenar_modelo()
-                    elif event.key == pygame.K_c:
-                        self.exportar_csv()
 
                 elif self.estado in ("manual", "auto"):
                     if event.key in (pygame.K_ESCAPE, pygame.K_p):
